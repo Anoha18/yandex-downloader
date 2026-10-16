@@ -1,0 +1,11 @@
+{
+  "downloadDir": "downloads",
+  "photosDir": "_unlimited_photos",
+  "profile": "normal",
+  "rateLimit": {
+    "maxAttempts": 7,
+    "baseDelayMs": 2000,
+    "maxDelayMs": 120000,
+    "cooldownMs": 300000
+  }
+}

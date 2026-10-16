@@ -1,0 +1,23 @@
+.omo
+node_modules/
+dist/
+logs/
+downloads/
+
+# Локальные данные и секреты приложения (config.json, token.json, state.db, logs/)
+data/
+data/logs/
+
+# SQLite
+*.db
+*.db-wal
+*.db-shm
+
+# Частично скачанные файлы
+*.part
+
+# Прочее
+.env
+*.log
+.DS_Store
+.codegraph
