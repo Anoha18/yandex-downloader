@@ -169,12 +169,10 @@ export class DownloadService {
           stats.filesSkipped += 1;
           this.progress.info(`↷ ${job.path} (уже есть, md5 совпал)`);
         } else {
-          this.db.markFileFailed(
-            job.path,
-            result.error ?? 'неизвестная ошибка',
-            this.ctx.maxAttempts,
-            Math.min(this.ctx.maxDelayMs, this.ctx.baseDelayMs * 2) / 1000,
-          );
+          // Внутри FileDownloader уже есть быстрые повторы (2–3), поэтому файл
+          // помечаем `failed` сразу: добор — через `--retry-failed`. Иначе очередь
+          // 7 раз переотдавала бы файл заново, плодя дубли `.part`.
+          this.db.markFileFailed(job.path, result.error ?? 'неизвестная ошибка', 1, 0);
           stats.filesFailed += 1;
           if (result.storageUnavailable === true) {
             stats.filesStorageUnavailable += 1;

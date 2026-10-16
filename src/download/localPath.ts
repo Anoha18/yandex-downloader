@@ -39,15 +39,21 @@ export function withSuffix(path: string, n: number): string {
 }
 
 /**
- * Выдаёт уникальные локальные пути в рамках одного прогона, добавляя суффикс
- * при совпадении (в т.ч. без учёта регистра).
+ * Выдаёт уникальные локальные пути, добавляя суффикс ` (n)` при коллизии
+ * РАЗНЫХ путей Диска (в т.ч. без учёта регистра). Один и тот же путь Диска
+ * всегда отображается в один и тот же локальный путь, чтобы повторные попытки
+ * докачивали тот же `.part`, а не создавали `(1)`, `(2)`, … заново.
  */
 export class PathAllocator {
   private readonly used = new Set<string>();
+  private readonly byRemote = new Map<string, string>();
 
   constructor(private readonly downloadDir: string) {}
 
   allocate(remotePath: string): string {
+    const memo = this.byRemote.get(remotePath);
+    if (memo !== undefined) return memo;
+
     const base = resolveLocalPath(this.downloadDir, remotePath);
     let candidate = base;
     let counter = 1;
@@ -55,6 +61,7 @@ export class PathAllocator {
       candidate = withSuffix(base, counter++);
     }
     this.used.add(candidate.toLowerCase());
+    this.byRemote.set(remotePath, candidate);
     return candidate;
   }
 }

@@ -26,8 +26,12 @@ test('withSuffix: суффикс перед расширением', () => {
   assert.equal(withSuffix('/dl/dir', 1), '/dl/dir (1)');
 });
 
-test('PathAllocator: разрешает коллизии', () => {
+test('PathAllocator: один путь → один результат, разные коллизии → суффикс', () => {
   const allocator = new PathAllocator('/dl');
+  // Повторная выдача того же пути Диска идемпотентна (чтобы докачивать тот же .part).
   assert.equal(allocator.allocate('disk:/x/y.txt'), '/dl/x/y.txt');
-  assert.equal(allocator.allocate('disk:/x/y.txt'), '/dl/x/y (1).txt');
+  assert.equal(allocator.allocate('disk:/x/y.txt'), '/dl/x/y.txt');
+  // Разные пути, санитайзинг которых совпал, получают суффикс.
+  assert.equal(allocator.allocate('disk:/x/co:n.txt'), '/dl/x/co_n.txt');
+  assert.equal(allocator.allocate('disk:/x/co_n.txt'), '/dl/x/co_n (1).txt');
 });

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -109,6 +109,43 @@ test('DownloadService: dry-run ничего не скачивает', async () =
     ).run();
     assert.equal(stats.filesDownloaded, 0);
     assert.deepEqual(db.countByStatus(), { pending: 2 });
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('DownloadService: провал сразу помечает failed и не плодит дубли .part', async () => {
+  const { dir, db, ctx } = setup();
+  try {
+    const fetchImpl: typeof fetch = async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+          controller.error(new Error('обрыв'));
+        },
+      });
+      return new Response(stream, { status: 200 });
+    };
+    ctx.http = new HttpClient('tok', { fetchImpl });
+
+    const stats = await new DownloadService(
+      db,
+      silent,
+      options({ concurrency: 1 }),
+      ctx,
+      progress,
+    ).run();
+
+    assert.equal(stats.filesFailed, 2);
+    assert.deepEqual(db.countByStatus(), { failed: 2 });
+
+    // Ровно по одному `.part` на файл и без суффиксов «(1)», «(2)»…
+    const parts = readdirSync(ctx.downloadDir, { recursive: true })
+      .map(String)
+      .filter((name) => name.endsWith('.part'))
+      .sort();
+    assert.deepEqual(parts, ['a.txt.part', 'b.txt.part']);
   } finally {
     db.close();
     rmSync(dir, { recursive: true, force: true });
