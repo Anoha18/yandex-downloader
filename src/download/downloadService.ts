@@ -5,7 +5,6 @@ import type { DiskApi } from '../api/diskApi.js';
 import type { HttpClient } from '../api/httpClient.js';
 import type { PhotosliceClient } from '../api/photosliceClient.js';
 import type { StateDb } from '../state/db.js';
-import { sleep } from '../util/async.js';
 import { ConfigError } from '../util/errors.js';
 import { humanBytes } from '../util/format.js';
 import { md5File } from '../util/hash.js';
@@ -30,6 +29,8 @@ export interface DownloadOptions {
 export interface DownloadContext {
   api: DiskApi;
   http: HttpClient;
+  /** Отдельный HTTP-клиент для фото (свой лимитер, без OAuth-заголовка). */
+  photoHttp?: HttpClient;
   photosClient?: PhotosliceClient;
   downloadDir: string;
   photosDir: string;
@@ -38,6 +39,8 @@ export interface DownloadContext {
   maxDelayMs: number;
   /** Таймаут ожидания ответа при скачивании, мс. */
   connectTimeoutMs?: number;
+  /** Таймаут простоя без данных при скачивании фото, мс. */
+  photoStallTimeoutMs?: number;
 }
 
 export interface DownloadStats {
@@ -52,8 +55,8 @@ export interface DownloadStats {
   bytes: number;
 }
 
-const PHOTO_RATE_LIMIT_PAUSE_MS = 45_000;
-const PHOTO_RATE_LIMIT_STREAK_LIMIT = 5;
+/** Пауза для фото при HTTP 429 (лимит запросов), сек. */
+const PHOTO_RATE_LIMIT_DELAY_SEC = 30;
 
 function normalizePrefix(path: string): string {
   if (path.startsWith('disk:')) return path;
@@ -343,9 +346,13 @@ export class DownloadService {
     this.progress.resetTotals();
     this.progress.setTotals({ items: pending });
 
-    const downloader = new PhotoDownloader(this.ctx.photosClient, this.ctx.http, {
+    // Свой HTTP-клиент для фото: отдельный лимитер, чтобы волна ошибок
+    // хранилища не морозила всё общим 5-минутным предохранителем.
+    const http = this.ctx.photoHttp ?? this.ctx.http;
+    const downloader = new PhotoDownloader(this.ctx.photosClient, http, {
       photosDir: this.ctx.photosDir,
       connectTimeoutMs: this.ctx.connectTimeoutMs,
+      stallTimeoutMs: this.ctx.photoStallTimeoutMs,
       seenMd5,
     });
 
@@ -353,7 +360,6 @@ export class DownloadService {
     const multi = concurrency > 1;
     const limit = this.options.limit;
     let taken = 0;
-    let cooldownUntil = 0;
     let stopped = false;
     let authError: string | null = null;
 
@@ -361,14 +367,9 @@ export class DownloadService {
 
     const worker = async (index: number): Promise<void> => {
       const key = String(index);
-      let rateLimitStreak = 0;
       for (;;) {
         if (stopped) return;
         if (limit !== undefined && taken >= limit) return;
-
-        const wait = cooldownUntil - Date.now();
-        if (wait > 0) await sleep(wait);
-        if (stopped) return;
 
         const [job] = this.db.claimPendingPhotos(1);
         if (!job) return;
@@ -397,12 +398,10 @@ export class DownloadService {
           stats.photosDownloaded += 1;
           stats.bytes += result.bytes ?? 0;
           this.progress.addBytes(result.bytes ?? 0);
-          rateLimitStreak = 0;
           this.progress.info(`✓ ${name} (${humanBytes(result.bytes ?? 0)})`);
         } else if (result.status === 'skipped') {
           this.db.markPhotoSkipped(job.id, result.localPath ?? '', result.md5, result.bytes);
           stats.photosSkipped += 1;
-          rateLimitStreak = 0;
           this.progress.info(`↷ ${name} (уже есть)`);
         } else {
           const error = result.error ?? 'неизвестная ошибка';
@@ -416,29 +415,15 @@ export class DownloadService {
           }
 
           if (result.failureKind === 'rate_limit') {
-            // Лимит Яндекса: попытку не сжигаем, файл вернётся в очередь после паузы.
-            this.db.setPhotoPending(job.id);
-            taken -= 1;
-            rateLimitStreak += 1;
-            const pause = Math.min(600_000, PHOTO_RATE_LIMIT_PAUSE_MS * 2 ** (rateLimitStreak - 1));
-            cooldownUntil = Math.max(cooldownUntil, Date.now() + pause);
-            this.progress.warn(
-              `Яндекс просит реже обращаться (${error}). Пауза ${Math.round(pause / 1000)} с`,
-            );
-            if (rateLimitStreak >= PHOTO_RATE_LIMIT_STREAK_LIMIT) {
-              stopped = true;
-              this.progress.warn(
-                'Слишком много HTTP 429 подряд — останавливаю скачивание фото, попробуйте позже.',
-              );
-              return;
-            }
+            // 429: попытку не сжигаем, вернём в очередь с небольшой задержкой,
+            // чтобы не упереться в лимит запросов Яндекса.
+            this.db.markPhotoDeferred(job.id, error, PHOTO_RATE_LIMIT_DELAY_SEC);
+            this.progress.warn(`${name}: ${error} — отложено на ${PHOTO_RATE_LIMIT_DELAY_SEC} с`);
             continue;
           }
 
-          const attempts = job.attempts ?? 0;
-          const fatal = result.failureKind === 'fatal';
-          const retryDelaySec = fatal ? 0 : Math.min(300, 15 * 2 ** attempts);
-          this.db.markPhotoFailed(job.id, error, fatal ? 1 : this.ctx.maxAttempts, retryDelaySec);
+          // Любая другая ошибка: помечаем failed, добор — через --retry-failed.
+          this.db.markPhotoFailed(job.id, error, 1, 0);
           stats.photosFailed += 1;
           this.progress.warn(`${name}: ${error}`);
         }

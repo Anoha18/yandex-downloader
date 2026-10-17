@@ -78,6 +78,7 @@ function usage(): string {
     '      --recheck             пересчитать md5 скачанного (файлы и фото) и перекачать побитое',
     '      --dry-run             только показать, что будет скачано',
     '      --download-timeout <с> таймаут соединения при скачивании, сек (по умолчанию 30)',
+    '      --stall-timeout <с>    таймаут простоя без данных для фото, сек (по умолчанию 60)',
     '',
   ].join('\n');
 }
@@ -118,6 +119,7 @@ async function main(argv: string[]): Promise<number> {
       'dry-run': { type: 'boolean' },
       quiet: { type: 'boolean' },
       'download-timeout': { type: 'string' },
+      'stall-timeout': { type: 'string' },
     },
     allowPositionals: true,
     strict: false,

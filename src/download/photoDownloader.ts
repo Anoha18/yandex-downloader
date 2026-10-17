@@ -26,8 +26,10 @@ export interface PhotoDownloadResult {
 
 export interface PhotoDownloaderOptions {
   photosDir: string;
-  /** Таймаут ожидания ответа при скачивании, мс. */
+  /** Таймаут ожидания ответа (заголовков), мс. */
   connectTimeoutMs?: number;
+  /** Таймаут простоя без данных, мс. */
+  stallTimeoutMs?: number;
   /** Множество md5 уже скачанных фото (для дедупликации). */
   seenMd5?: Set<string>;
 }
@@ -96,7 +98,8 @@ export class PhotoDownloader {
       const { url } = await this.client.getFileUrl(ref);
       const result = await this.http.downloadToFile(url, partPath, {
         rangeFrom: existsSync(partPath) ? statSize(partPath) : 0,
-        connectTimeoutMs: this.options.connectTimeoutMs,
+        connectTimeoutMs: this.options.connectTimeoutMs ?? 15_000,
+        stallTimeoutMs: this.options.stallTimeoutMs ?? 60_000,
         sendAuth: false,
         onProgress,
       });

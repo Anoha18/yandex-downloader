@@ -557,6 +557,17 @@ export class StateDb {
       );
   }
 
+  /** Откладывает фото (сбой хранилища/сети), не сжигая попытку. */
+  markPhotoDeferred(id: string, error: string, retryDelaySec: number): void {
+    this.db
+      .prepare(
+        `UPDATE photos SET status = 'pending',
+           next_retry_at = datetime('now', '+' || ? || ' seconds'),
+           error = ? WHERE id = ?`,
+      )
+      .run(Math.max(0, Math.round(retryDelaySec)), error.slice(0, 500), id);
+  }
+
   resetPhotosInProgress(): number {
     return this.db
       .prepare("UPDATE photos SET status = 'pending' WHERE status = 'in_progress'")

@@ -130,3 +130,23 @@ test('photos: кластеры, upsert и сводка', () =>
     db.setPhotoStatus('p1', 'downloaded');
     assert.deepEqual(db.summarizePhotos().byStatus, { downloaded: 1 });
   }));
+
+test('photos: markPhotoDeferred откладывает без времени и не сжигает попытку', () =>
+  withDb((db) => {
+    db.upsertPhotos([
+      {
+        id: 'p1',
+        clusterId: null,
+        name: 'a.jpg',
+        size: 5,
+        md5: 'm',
+        mime: null,
+        takenAt: null,
+        remoteRef: 'p1',
+      },
+    ]);
+
+    db.markPhotoDeferred('p1', 'HTTP 429', 60);
+    assert.equal(db.claimPendingPhotos(1).length, 0); // ещё не время
+    assert.deepEqual(db.summarizePhotos().byStatus, { pending: 1 });
+  }));

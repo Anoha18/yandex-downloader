@@ -14,6 +14,7 @@ import {
   DownloadService,
 } from '../src/download/downloadService.js';
 import { StateDb } from '../src/state/db.js';
+import { HttpError } from '../src/util/errors.js';
 import type { Logger } from '../src/util/logger.js';
 import { ProgressReporter } from '../src/util/progress.js';
 
@@ -205,6 +206,89 @@ test('DownloadService: переносит фото из старой папки 
     assert.equal(photo?.local_path, join(dir, 'photos', 'p.jpg'));
     assert.ok(existsSync(join(dir, 'photos', 'p.jpg')));
     assert.ok(!existsSync(oldPath));
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function insertPhoto(db: StateDb, id: string, name: string, size: number): void {
+  db.upsertPhotos([
+    {
+      id,
+      clusterId: null,
+      name,
+      size,
+      md5: 'm',
+      mime: null,
+      takenAt: null,
+      remoteRef: id,
+    },
+  ]);
+}
+
+function photoCtx(dir: string, photosClient: PhotosliceClient): DownloadContext {
+  return {
+    api: {} as DiskApi,
+    http: new HttpClient('tok'),
+    photosClient,
+    downloadDir: join(dir, 'out'),
+    photosDir: join(dir, 'photos'),
+    maxAttempts: 2,
+    baseDelayMs: 1,
+    maxDelayMs: 2,
+  };
+}
+
+test('DownloadService: ошибка хранилища помечает фото failed (добор через --retry-failed)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'yd-ds-'));
+  const db = StateDb.open(join(dir, 'state.db'));
+  try {
+    insertPhoto(db, '/photounlim/p.jpg', 'p.jpg', 3);
+    const photosClient = {
+      async getFileUrl(): Promise<never> {
+        throw new HttpError(500, 'download: HTTP 500');
+      },
+    } as unknown as PhotosliceClient;
+
+    const stats = await new DownloadService(
+      db,
+      silent,
+      options({ files: false, photos: true, concurrency: 1, limit: 1 }),
+      photoCtx(dir, photosClient),
+      progress,
+    ).run();
+
+    assert.equal(stats.photosFailed, 1);
+    assert.deepEqual(db.summarizePhotos().byStatus, { failed: 1 });
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('DownloadService: 429 откладывает фото, не сжигая попытку', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'yd-ds-'));
+  const db = StateDb.open(join(dir, 'state.db'));
+  try {
+    insertPhoto(db, '/photounlim/p.jpg', 'p.jpg', 3);
+    const photosClient = {
+      async getFileUrl(): Promise<never> {
+        throw new HttpError(429, 'photoslice: HTTP 429');
+      },
+    } as unknown as PhotosliceClient;
+
+    const stats = await new DownloadService(
+      db,
+      silent,
+      options({ files: false, photos: true, concurrency: 1, limit: 1 }),
+      photoCtx(dir, photosClient),
+      progress,
+    ).run();
+
+    assert.equal(stats.photosFailed, 0);
+    assert.deepEqual(db.summarizePhotos().byStatus, { pending: 1 });
+    assert.equal(db.claimPendingPhotos(1).length, 0); // отложено
   } finally {
     db.close();
     rmSync(dir, { recursive: true, force: true });
