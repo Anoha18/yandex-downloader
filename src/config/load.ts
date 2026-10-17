@@ -15,7 +15,7 @@ import {
 export function defaultConfig(paths: AppPaths, projectRoot: string): AppConfig {
   return {
     downloadDir: join(projectRoot, 'downloads'),
-    photosDir: join(projectRoot, '_unlimited_photos'),
+    photosDir: join(projectRoot, 'downloads', '_unlimited_photos'),
     oauth: { clientId: '', clientSecret: '' },
     tokenPath: paths.tokenFile,
     statePath: paths.stateDb,
@@ -132,15 +132,25 @@ export function loadConfig(options: LoadConfigOptions = {}): LoadedConfig {
   const projectRoot = findProjectRoot();
   const paths = resolveAppPaths();
   const configPath = options.configPath ? resolve(options.configPath) : paths.configFile;
+  const env = options.env ?? process.env;
 
   const defaults = defaultConfig(paths, projectRoot);
   const configFileExists = existsSync(configPath);
   const raw = configFileExists ? readConfigFile(configPath) : undefined;
 
   let config = validateConfig(raw, defaults);
-  config = applyEnv(config, options.env ?? process.env);
+  config = applyEnv(config, env);
   config = applyOverrides(config, options.overrides);
   config = normalizePaths(config, paths, projectRoot);
+
+  // Если photosDir не задан явно (ни в конфиге, ни в окружении), кладём
+  // безлимитные фото внутрь downloadDir, а не рядом с проектом.
+  const photosDirExplicit =
+    (typeof raw === 'object' && raw !== null && !Array.isArray(raw) && 'photosDir' in raw) ||
+    Boolean(env.YD_PHOTOS_DIR?.trim());
+  if (!photosDirExplicit) {
+    config.photosDir = join(config.downloadDir, '_unlimited_photos');
+  }
 
   return { config, paths, projectRoot, configPath, configFileExists };
 }

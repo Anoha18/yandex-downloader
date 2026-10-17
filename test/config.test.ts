@@ -97,3 +97,20 @@ test('loadConfig: приоритеты — CLI-флаг профиля выше 
   });
   assert.equal(config.profile, 'gentle');
 });
+
+test('loadConfig: photosDir по умолчанию лежит внутри downloadDir', () => {
+  const { config } = loadConfig({
+    ...noConfig,
+    env: { YD_DOWNLOAD_DIR: '/mnt/backup' },
+  });
+  assert.equal(config.downloadDir, '/mnt/backup');
+  assert.equal(config.photosDir, '/mnt/backup/_unlimited_photos');
+});
+
+test('loadConfig: явный YD_PHOTOS_DIR перекрывает путь по умолчанию', () => {
+  const { config } = loadConfig({
+    ...noConfig,
+    env: { YD_DOWNLOAD_DIR: '/mnt/backup', YD_PHOTOS_DIR: '/photos' },
+  });
+  assert.equal(config.photosDir, '/photos');
+});

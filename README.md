@@ -7,7 +7,7 @@
 > Статус: **Этап 4 (готов)**. Реализованы: OAuth (`auth`), `whoami`, `ls`, скан
 > Диска (`scan`, конкурентный), каталог безлимитных фото (`photos`) с
 > автополучением cookies, `stats` и скачивание (`download`) — файлы с сохранением
-> структуры и фото в `_unlimited_photos`.
+> структуры и фото в `<downloadDir>/_unlimited_photos`.
 
 ## Требования
 
@@ -141,6 +141,10 @@ pnpm dev photos export photos.json
 - **`data/config.json`** — только поведение: `downloadDir`, `photosDir`, `profile`,
   `rateLimit` и пути. Создаётся командой `config init`.
 
+Если `photosDir` не задан явно (ни в конфиге, ни в `YD_PHOTOS_DIR`), безлимитные
+фото складываются в `<downloadDir>/_unlimited_photos`. Относительный `photosDir`
+считается от корня проекта.
+
 Всё локальное состояние — в каталоге `data/` (gitignored):
 
 ```
@@ -179,5 +183,5 @@ pnpm test              # node:test
 - **Этап 2** ✅ — скан Диска (плоский + `--deep`), очередь в SQLite, `stats`.
 - **Этап 2.1** ✅ — конкурентное сканирование (`--concurrency`).
 - **Этап 3** ✅ — автополучение cookies (Playwright) и каталог безлимитных фото.
-- **Этап 4** ✅ — скачивание: файлы (с сохранением структуры) + фото (в `_unlimited_photos`),
+- **Этап 4** ✅ — скачивание: файлы (с сохранением структуры) + фото (в `<downloadDir>/_unlimited_photos`),
   докачка `.part` по Range, проверка md5, адаптивный лимитер и предохранитель (429/503).

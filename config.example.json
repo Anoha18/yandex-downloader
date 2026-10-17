@@ -1,6 +1,5 @@
 {
   "downloadDir": "downloads",
-  "photosDir": "_unlimited_photos",
   "profile": "normal",
   "rateLimit": {
     "maxAttempts": 7,

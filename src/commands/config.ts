@@ -16,6 +16,7 @@ function renderConfig(ctx: CommandContext): string {
     configPath: ctx.configPath,
     configFileExists: ctx.configFileExists,
     downloadDir: config.downloadDir,
+    photosDir: config.photosDir,
     oauth: {
       source: '.env (YD_OAUTH_CLIENT_ID / YD_OAUTH_CLIENT_SECRET)',
       clientId: maskSecret(config.oauth.clientId),

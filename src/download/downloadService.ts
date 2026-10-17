@@ -1,4 +1,5 @@
-import { existsSync } from 'node:fs';
+import { copyFileSync, existsSync, renameSync, unlinkSync } from 'node:fs';
+import { basename, isAbsolute, relative, resolve } from 'node:path';
 
 import type { DiskApi } from '../api/diskApi.js';
 import type { HttpClient } from '../api/httpClient.js';
@@ -9,8 +10,10 @@ import { ConfigError } from '../util/errors.js';
 import { humanBytes } from '../util/format.js';
 import { md5File } from '../util/hash.js';
 import type { Logger } from '../util/logger.js';
+import { ensureDir } from '../util/paths.js';
 import type { ProgressReporter } from '../util/progress.js';
 import { FileDownloader } from './fileDownloader.js';
+import { withSuffix } from './localPath.js';
 import { PhotoDownloader } from './photoDownloader.js';
 
 export interface DownloadOptions {
@@ -56,6 +59,33 @@ function normalizePrefix(path: string): string {
   if (path.startsWith('disk:')) return path;
   if (path.startsWith('/')) return `disk:${path}`;
   return `disk:/${path}`;
+}
+
+/** Лежит ли путь внутри каталога. */
+function isInsideDir(dir: string, path: string): boolean {
+  const rel = relative(dir, path);
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+}
+
+/** Перенос файла с фолбэком на копирование между разными ФС. */
+function moveFile(from: string, to: string): void {
+  try {
+    renameSync(from, to);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error;
+    copyFileSync(from, to);
+    unlinkSync(from);
+  }
+}
+
+/** Уникальное имя в каталоге (не затирая существующие файлы). */
+function uniquePhotoName(dir: string, name: string): string {
+  let candidate = resolve(dir, name);
+  let counter = 1;
+  while (existsSync(candidate)) {
+    candidate = withSuffix(resolve(dir, name), counter++);
+  }
+  return candidate;
 }
 
 /** Оркестрация скачивания: обычные файлы (пул воркеров) и фото (пачки ZIP). */
@@ -221,6 +251,70 @@ export class DownloadService {
     if (pending > 0) this.progress.info(`Перепроверка: ${pending} файлов вернулись в очередь`);
   }
 
+  private async recheckPhotos(): Promise<void> {
+    const photos = this.db.downloadedPhotos();
+    let pending = 0;
+    for (const photo of photos) {
+      if (!photo.local_path || !existsSync(photo.local_path)) {
+        this.db.setPhotoPending(photo.id);
+        pending += 1;
+        continue;
+      }
+      if (photo.md5) {
+        const md5 = await md5File(photo.local_path);
+        if (md5 !== photo.md5) {
+          this.db.setPhotoPending(photo.id);
+          pending += 1;
+          this.progress.warn(`md5 не сошёлся, перекачаем фото: ${photo.id}`);
+        }
+      }
+    }
+    if (pending > 0) this.progress.info(`Перепроверка фото: ${pending} вернулись в очередь`);
+  }
+
+  /**
+   * Приводит локальные пути уже скачанных фото к текущему `photosDir`.
+   *
+   * Если файл лежит вне настроенной папки (например, скачан старым дефолтом) —
+   * переносим его внутрь. Если файла нет — возвращаем фото в очередь.
+   */
+  private reconcilePhotoPaths(): void {
+    const root = resolve(this.ctx.photosDir);
+    const photos = this.db.downloadedPhotos();
+    let moved = 0;
+    let requeued = 0;
+
+    for (const photo of photos) {
+      if (!photo.local_path) {
+        this.db.setPhotoPending(photo.id);
+        requeued += 1;
+        continue;
+      }
+      const path = resolve(photo.local_path);
+      if (!existsSync(path)) {
+        this.db.setPhotoPending(photo.id);
+        requeued += 1;
+        continue;
+      }
+      if (isInsideDir(root, path)) continue;
+
+      try {
+        ensureDir(root);
+        const dest = uniquePhotoName(root, basename(path));
+        moveFile(path, dest);
+        this.db.updatePhotoLocalPath(photo.id, dest);
+        moved += 1;
+      } catch {
+        this.db.setPhotoPending(photo.id);
+        requeued += 1;
+      }
+    }
+
+    if (moved > 0) this.progress.info(`Фото перенесено в ${root}: ${moved}`);
+    if (requeued > 0)
+      this.progress.info(`Фото без локальных файлов вернулись в очередь: ${requeued}`);
+  }
+
   private async runPhotos(stats: DownloadStats): Promise<void> {
     if (this.options.retryFailed) {
       const n = this.db.retryFailedPhotos();
@@ -228,6 +322,9 @@ export class DownloadService {
     }
     const reset = this.db.resetPhotosInProgress();
     if (reset > 0) this.progress.info(`Восстановлено после остановки: ${reset} фото`);
+
+    this.reconcilePhotoPaths();
+    if (this.options.recheck) await this.recheckPhotos();
 
     const summary = this.db.summarizePhotos();
     const pending = summary.byStatus.pending ?? 0;

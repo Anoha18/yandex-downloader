@@ -594,6 +594,10 @@ export class StateDb {
       .run(`${normalized}/%`).changes as number;
   }
 
+  updatePhotoLocalPath(id: string, localPath: string): void {
+    this.db.prepare('UPDATE photos SET local_path = ? WHERE id = ?').run(localPath, id);
+  }
+
   downloadedPhotoMd5s(): string[] {
     const rows = this.db
       .prepare(
@@ -601,6 +605,12 @@ export class StateDb {
       )
       .all() as unknown as Array<{ md5: string }>;
     return rows.map((row) => row.md5);
+  }
+
+  downloadedPhotos(): Array<{ id: string; md5: string | null; local_path: string | null }> {
+    return this.db
+      .prepare("SELECT id, md5, local_path FROM photos WHERE status IN ('downloaded','skipped')")
+      .all() as unknown as Array<{ id: string; md5: string | null; local_path: string | null }>;
   }
 
   close(): void {

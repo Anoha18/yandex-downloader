@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
 import type { DiskApi } from '../src/api/diskApi.js';
 import { HttpClient } from '../src/api/httpClient.js';
+import type { PhotosliceClient } from '../src/api/photosliceClient.js';
 import {
   type DownloadContext,
   type DownloadOptions,
@@ -146,6 +147,64 @@ test('DownloadService: провал сразу помечает failed и не �
       .filter((name) => name.endsWith('.part'))
       .sort();
     assert.deepEqual(parts, ['a.txt.part', 'b.txt.part']);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('DownloadService: переносит фото из старой папки в текущий photosDir', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'yd-ds-'));
+  const db = StateDb.open(join(dir, 'state.db'));
+  try {
+    const oldDir = join(dir, 'old');
+    mkdirSync(oldDir, { recursive: true });
+    const content = Buffer.from('photo');
+    const oldPath = join(oldDir, 'p.jpg');
+    writeFileSync(oldPath, content);
+
+    db.upsertPhotos([
+      {
+        id: '/photounlim/p.jpg',
+        clusterId: null,
+        name: 'p.jpg',
+        size: content.length,
+        md5: md5(content),
+        mime: 'image/jpeg',
+        takenAt: null,
+        remoteRef: '/photounlim/p.jpg',
+      },
+    ]);
+    db.markPhotoDownloaded('/photounlim/p.jpg', oldPath, md5(content), content.length);
+
+    const photosClient = {
+      async getFileUrl() {
+        throw new Error('не должен вызываться');
+      },
+    } as unknown as PhotosliceClient;
+    const ctx: DownloadContext = {
+      api: {} as DiskApi,
+      http: new HttpClient('tok'),
+      photosClient,
+      downloadDir: join(dir, 'out'),
+      photosDir: join(dir, 'photos'),
+      maxAttempts: 2,
+      baseDelayMs: 1,
+      maxDelayMs: 2,
+    };
+
+    await new DownloadService(
+      db,
+      silent,
+      options({ files: false, photos: true, concurrency: 1 }),
+      ctx,
+      progress,
+    ).run();
+
+    const photo = db.downloadedPhotos()[0];
+    assert.equal(photo?.local_path, join(dir, 'photos', 'p.jpg'));
+    assert.ok(existsSync(join(dir, 'photos', 'p.jpg')));
+    assert.ok(!existsSync(oldPath));
   } finally {
     db.close();
     rmSync(dir, { recursive: true, force: true });
