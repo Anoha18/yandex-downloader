@@ -85,4 +85,12 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX IF NOT EXISTS idx_photos_md5 ON photos(md5);
     `,
   },
+  {
+    version: 4,
+    name: 'photos_retry_schedule',
+    sql: `
+      ALTER TABLE photos ADD COLUMN next_retry_at TEXT;
+      CREATE INDEX IF NOT EXISTS idx_photos_retry ON photos(status, next_retry_at);
+    `,
+  },
 ];

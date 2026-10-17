@@ -79,6 +79,7 @@ export interface PhotoJob {
   size: number | null;
   md5: string | null;
   remote_ref: string | null;
+  attempts: number;
 }
 
 /**
@@ -496,52 +497,64 @@ export class StateDb {
 
   // ── очередь скачивания: фото ───────────────────────────────────────────────
 
-  claimPendingPhotos(limit: number, maxBytes: number): PhotoJob[] {
+  claimPendingPhotos(limit: number): PhotoJob[] {
     return this.transaction(() => {
       const rows = this.db
         .prepare(
-          "SELECT id, name, size, md5, remote_ref FROM photos WHERE status = 'pending' ORDER BY cluster_id, name LIMIT ?",
+          `SELECT id, name, size, md5, remote_ref, attempts FROM photos
+             WHERE status = 'pending'
+               AND (next_retry_at IS NULL OR next_retry_at <= datetime('now'))
+             ORDER BY rowid LIMIT ?`,
         )
-        .all(Math.max(limit * 3, 30)) as unknown as PhotoJob[];
-
-      const selected: PhotoJob[] = [];
-      let bytes = 0;
-      for (const row of rows) {
-        if (selected.length >= limit) break;
-        const size = row.size ?? 0;
-        if (selected.length > 0 && bytes + size > maxBytes) break;
-        selected.push(row);
-        bytes += size;
-      }
+        .all(limit) as unknown as PhotoJob[];
 
       const stmt = this.db.prepare("UPDATE photos SET status = 'in_progress' WHERE id = ?");
-      for (const row of selected) stmt.run(row.id);
-      return selected;
+      for (const row of rows) stmt.run(row.id);
+      return rows;
     });
   }
 
-  markPhotoDownloaded(id: string, localPath: string): void {
+  markPhotoDownloaded(
+    id: string,
+    localPath: string,
+    md5?: string | null,
+    size?: number | null,
+  ): void {
     this.db
       .prepare(
-        "UPDATE photos SET status = 'downloaded', local_path = ?, downloaded_at = datetime('now'), error = NULL WHERE id = ?",
+        `UPDATE photos SET status = 'downloaded', local_path = ?, downloaded_at = datetime('now'),
+         md5 = COALESCE(?, md5), size = COALESCE(?, size),
+         error = NULL, next_retry_at = NULL WHERE id = ?`,
       )
-      .run(localPath, id);
+      .run(localPath || null, md5 ?? null, size ?? null, id);
   }
 
-  markPhotoSkipped(id: string, localPath: string): void {
+  markPhotoSkipped(id: string, localPath: string, md5?: string | null, size?: number | null): void {
     this.db
-      .prepare("UPDATE photos SET status = 'skipped', local_path = ?, error = NULL WHERE id = ?")
-      .run(localPath, id);
+      .prepare(
+        `UPDATE photos SET status = 'skipped', local_path = ?,
+         md5 = COALESCE(?, md5), size = COALESCE(?, size),
+         error = NULL, next_retry_at = NULL WHERE id = ?`,
+      )
+      .run(localPath || null, md5 ?? null, size ?? null, id);
   }
 
-  markPhotoFailed(id: string, error: string, maxAttempts: number): void {
+  markPhotoFailed(id: string, error: string, maxAttempts: number, retryDelaySec: number): void {
     this.db
       .prepare(
         `UPDATE photos SET attempts = attempts + 1,
            status = CASE WHEN attempts + 1 >= ? THEN 'failed' ELSE 'pending' END,
+           next_retry_at = CASE WHEN attempts + 1 >= ? THEN NULL
+             ELSE datetime('now', '+' || ? || ' seconds') END,
            error = ? WHERE id = ?`,
       )
-      .run(maxAttempts, error.slice(0, 500), id);
+      .run(
+        maxAttempts,
+        maxAttempts,
+        Math.max(0, Math.round(retryDelaySec)),
+        error.slice(0, 500),
+        id,
+      );
   }
 
   resetPhotosInProgress(): number {
@@ -553,9 +566,32 @@ export class StateDb {
   retryFailedPhotos(): number {
     return this.db
       .prepare(
-        "UPDATE photos SET status = 'pending', attempts = 0, error = NULL WHERE status = 'failed'",
+        "UPDATE photos SET status = 'pending', attempts = 0, next_retry_at = NULL, error = NULL WHERE status = 'failed'",
       )
       .run().changes as number;
+  }
+
+  setPhotoPending(id: string): void {
+    this.db
+      .prepare(
+        "UPDATE photos SET status = 'pending', attempts = 0, next_retry_at = NULL, error = NULL WHERE id = ?",
+      )
+      .run(id);
+  }
+
+  /**
+   * Удаляет из очереди безлимита фото вне указанного корня (например, `/disk/...`).
+   *
+   * Старый сбор через photoslice тащил в эту таблицу все фото аккаунта, включая
+   * обычный Диск. Такие файлы качает ветка `files`, а через mpfs они недоступны.
+   */
+  dropPhotosOutside(prefix: string): number {
+    const normalized = prefix.replace(/\/+$/, '');
+    return this.db
+      .prepare(
+        "DELETE FROM photos WHERE status IN ('pending','in_progress','failed') AND id NOT LIKE ?",
+      )
+      .run(`${normalized}/%`).changes as number;
   }
 
   downloadedPhotoMd5s(): string[] {

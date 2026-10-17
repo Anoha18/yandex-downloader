@@ -4,6 +4,8 @@ import type { DiskApi } from '../api/diskApi.js';
 import type { HttpClient } from '../api/httpClient.js';
 import type { PhotosliceClient } from '../api/photosliceClient.js';
 import type { StateDb } from '../state/db.js';
+import { sleep } from '../util/async.js';
+import { ConfigError } from '../util/errors.js';
 import { humanBytes } from '../util/format.js';
 import { md5File } from '../util/hash.js';
 import type { Logger } from '../util/logger.js';
@@ -47,8 +49,8 @@ export interface DownloadStats {
   bytes: number;
 }
 
-const PHOTO_BATCH_COUNT = 60;
-const PHOTO_BATCH_BYTES = 500 * 1024 * 1024;
+const PHOTO_RATE_LIMIT_PAUSE_MS = 45_000;
+const PHOTO_RATE_LIMIT_STREAK_LIMIT = 5;
 
 function normalizePrefix(path: string): string {
   if (path.startsWith('disk:')) return path;
@@ -243,43 +245,115 @@ export class DownloadService {
     const seenMd5 = new Set(this.db.downloadedPhotoMd5s());
     this.progress.resetTotals();
     this.progress.setTotals({ items: pending });
+
     const downloader = new PhotoDownloader(this.ctx.photosClient, this.ctx.http, {
       photosDir: this.ctx.photosDir,
+      connectTimeoutMs: this.ctx.connectTimeoutMs,
       seenMd5,
     });
 
-    for (;;) {
-      const batch = this.db.claimPendingPhotos(PHOTO_BATCH_COUNT, PHOTO_BATCH_BYTES);
-      if (batch.length === 0) break;
+    const concurrency = Math.max(1, this.options.concurrency);
+    const multi = concurrency > 1;
+    const limit = this.options.limit;
+    let taken = 0;
+    let cooldownUntil = 0;
+    let stopped = false;
+    let authError: string | null = null;
 
-      const batchBytes = batch.reduce((sum, photo) => sum + (photo.size ?? 0), 0);
-      this.progress.info(`↓ пачка фото: ${batch.length} шт (${humanBytes(batchBytes)})`);
-      this.progress.setCurrent(`архив (${batch.length} фото)`, batchBytes);
+    if (multi) this.progress.setActive(concurrency);
 
-      const results = await downloader.downloadBatch(batch);
-      this.progress.clearCurrent();
+    const worker = async (index: number): Promise<void> => {
+      const key = String(index);
+      let rateLimitStreak = 0;
+      for (;;) {
+        if (stopped) return;
+        if (limit !== undefined && taken >= limit) return;
 
-      for (const result of results) {
-        if (result.status === 'downloaded') {
-          this.db.markPhotoDownloaded(result.id, result.localPath ?? '');
-          stats.photosDownloaded += 1;
-        } else if (result.status === 'skipped') {
-          this.db.markPhotoSkipped(result.id, result.localPath ?? '');
-          stats.photosSkipped += 1;
+        const wait = cooldownUntil - Date.now();
+        if (wait > 0) await sleep(wait);
+        if (stopped) return;
+
+        const [job] = this.db.claimPendingPhotos(1);
+        if (!job) return;
+        taken += 1;
+
+        const name = job.name ?? job.remote_ref ?? job.id;
+        if (multi) {
+          this.progress.beginFile(key, name, job.size ?? undefined);
         } else {
-          this.db.markPhotoFailed(
-            result.id,
-            result.error ?? 'неизвестная ошибка',
-            this.ctx.maxAttempts,
-          );
-          stats.photosFailed += 1;
+          this.progress.setCurrent(name, job.size ?? undefined);
         }
+
+        let result: Awaited<ReturnType<PhotoDownloader['downloadOne']>>;
+        try {
+          result = await downloader.downloadOne(job, (written) => {
+            if (multi) this.progress.updateFile(key, written);
+            else this.progress.currentProgress(written);
+          });
+        } finally {
+          if (multi) this.progress.endFile(key);
+          else this.progress.clearCurrent();
+        }
+
+        if (result.status === 'downloaded') {
+          this.db.markPhotoDownloaded(job.id, result.localPath ?? '', result.md5, result.bytes);
+          stats.photosDownloaded += 1;
+          stats.bytes += result.bytes ?? 0;
+          this.progress.addBytes(result.bytes ?? 0);
+          rateLimitStreak = 0;
+          this.progress.info(`✓ ${name} (${humanBytes(result.bytes ?? 0)})`);
+        } else if (result.status === 'skipped') {
+          this.db.markPhotoSkipped(job.id, result.localPath ?? '', result.md5, result.bytes);
+          stats.photosSkipped += 1;
+          rateLimitStreak = 0;
+          this.progress.info(`↷ ${name} (уже есть)`);
+        } else {
+          const error = result.error ?? 'неизвестная ошибка';
+
+          if (result.failureKind === 'auth') {
+            // Куки протухли: фото возвращаем в очередь и выходим с понятной ошибкой.
+            this.db.setPhotoPending(job.id);
+            authError = `${error}. Обновите cookies: yd photos auth`;
+            stopped = true;
+            return;
+          }
+
+          if (result.failureKind === 'rate_limit') {
+            // Лимит Яндекса: попытку не сжигаем, файл вернётся в очередь после паузы.
+            this.db.setPhotoPending(job.id);
+            taken -= 1;
+            rateLimitStreak += 1;
+            const pause = Math.min(600_000, PHOTO_RATE_LIMIT_PAUSE_MS * 2 ** (rateLimitStreak - 1));
+            cooldownUntil = Math.max(cooldownUntil, Date.now() + pause);
+            this.progress.warn(
+              `Яндекс просит реже обращаться (${error}). Пауза ${Math.round(pause / 1000)} с`,
+            );
+            if (rateLimitStreak >= PHOTO_RATE_LIMIT_STREAK_LIMIT) {
+              stopped = true;
+              this.progress.warn(
+                'Слишком много HTTP 429 подряд — останавливаю скачивание фото, попробуйте позже.',
+              );
+              return;
+            }
+            continue;
+          }
+
+          const attempts = job.attempts ?? 0;
+          const fatal = result.failureKind === 'fatal';
+          const retryDelaySec = fatal ? 0 : Math.min(300, 15 * 2 ** attempts);
+          this.db.markPhotoFailed(job.id, error, fatal ? 1 : this.ctx.maxAttempts, retryDelaySec);
+          stats.photosFailed += 1;
+          this.progress.warn(`${name}: ${error}`);
+        }
+
+        this.progress.incItems(1);
       }
-      this.progress.incItems(results.length);
-      this.progress.info(
-        `Фото: скачано ${stats.photosDownloaded}, пропущено ${stats.photosSkipped}, ошибок ${stats.photosFailed}`,
-      );
-    }
+    };
+
+    await Promise.all(Array.from({ length: concurrency }, (_, index) => worker(index)));
+    if (multi) this.progress.setActive(0);
+
+    if (authError) throw new ConfigError(authError);
 
     this.progress.info(
       `Фото завершены: скачано ${stats.photosDownloaded}, пропущено ${stats.photosSkipped}, ошибок ${stats.photosFailed}`,

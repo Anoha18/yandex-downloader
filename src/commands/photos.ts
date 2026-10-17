@@ -65,8 +65,8 @@ async function collect(ctx: CommandContext, options: Record<string, unknown>): P
       const lines = [
         '',
         'Каталог безлимитных фото собран.',
-        `Кластеров (дней): ${result.clusters}`,
-        `Фото: ${result.photos} (${humanBytes(result.totalSize)})`,
+        `Папок обойдено: ${result.dirs}`,
+        `Фото прочитано: ${result.files} (${humanBytes(result.totalSize)})`,
         `Длительность: ${(result.durationMs / 1000).toFixed(1)} с`,
       ];
       process.stdout.write(`${lines.join('\n')}\n`);

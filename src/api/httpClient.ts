@@ -40,6 +40,8 @@ export interface DownloadOptions {
   connectTimeoutMs?: number;
   /** Таймаут простоя без данных, мс. */
   stallTimeoutMs?: number;
+  /** Отправлять OAuth-заголовок. Для подписанных ссылок (фото mpfs) не нужен. */
+  sendAuth?: boolean;
 }
 
 export interface DownloadResult {
@@ -180,7 +182,9 @@ export class HttpClient {
     }
 
     const headers: Record<string, string> = { Accept: '*/*' };
-    if (this.accessToken) headers.Authorization = `OAuth ${this.accessToken}`;
+    if (this.accessToken && options.sendAuth !== false) {
+      headers.Authorization = `OAuth ${this.accessToken}`;
+    }
     if (prefix > 0) headers.Range = `bytes=${prefix}-`;
 
     const connectTimeoutMs = options.connectTimeoutMs ?? 5_000;

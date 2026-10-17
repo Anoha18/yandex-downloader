@@ -1,3 +1,5 @@
+import { basename } from 'node:path';
+
 import type { Cookie } from '../auth/cookies.js';
 import { cookiesToRecord } from '../auth/cookies.js';
 import { sleep } from '../util/async.js';
@@ -10,20 +12,33 @@ const USER_AGENT =
 /** Сессионные cookies, по которым определяем авторизацию. */
 const SESSION_COOKIE_NAMES = ['Session_id', 'sessionid', 'yandex_login', 'L'];
 
-export interface PhotoCluster {
-  id: string;
-  size: number;
-}
+/** Корень безлимитного фото-хранилища во внутреннем API Диска. */
+export const UNLIM_ROOT = '/photounlim';
+/** Сколько детей запрашивать за одну страницу mpfs/list. */
+export const LIST_PAGE = 1000;
+const LIST_META = 'size,md5,mimetype,mediatype';
 
+/** Файл безлимитного хранилища (mpfs). */
 export interface PhotoItem {
   id: string;
-  clusterId: string;
-  name: string | null;
+  name: string;
   size: number | null;
   md5: string | null;
   mime: string | null;
-  takenAt: string | null;
   remoteRef: string;
+}
+
+/** Страница листинга папки безлимита. */
+export interface ListPage {
+  files: PhotoItem[];
+  dirs: string[];
+  /** Сколько детей пришло на странице (без самой папки). */
+  children: number;
+}
+
+/** Подписанная ссылка на оригинал файла. */
+export interface FileUrl {
+  url: string;
 }
 
 export type FetchLike = typeof fetch;
@@ -36,6 +51,12 @@ export interface PhotosliceOptions {
   maxDelayMs?: number;
   /** Вызывается при 401/403: пересобрать cookies (например, через браузер). */
   onSessionExpired?: () => Promise<Cookie[]>;
+}
+
+interface ApiError {
+  status: number | null;
+  code: number | null;
+  title: string | null;
 }
 
 function backoffDelay(attempt: number, baseMs: number, maxMs: number): number {
@@ -53,11 +74,52 @@ function buildCookieHeader(cookies: Cookie[]): string {
     .join('; ');
 }
 
+function parseRetryAfter(value: string | null): number | null {
+  if (!value) return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(value);
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  return null;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Достаёт ошибку из тела ответа web-API (`{error:{statusCode,code,title}}` или строка). */
+function extractApiError(data: unknown): ApiError | null {
+  if (!isPlainObject(data) || !('error' in data)) return null;
+  const raw = data.error;
+  if (typeof raw === 'string') return { status: null, code: null, title: raw };
+  if (!isPlainObject(raw)) return null;
+  return {
+    status: typeof raw.statusCode === 'number' ? raw.statusCode : null,
+    code: typeof raw.code === 'number' ? raw.code : null,
+    title: typeof raw.title === 'string' ? raw.title : null,
+  };
+}
+
+function str(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function num(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
 /**
- * Клиент внутреннего web-API безлимитного фото-хранилища Яндекса (photoslice).
+ * Клиент внутреннего web-API безлимитного фото-хранилища Яндекса (mpfs).
  *
  * Неофициальный интерфейс `disk.yandex.ru/models-v2`, требует cookies браузерной
- * сессии. Может измениться со стороны Яндекса.
+ * сессии. Массовая выгрузка ZIP (`mpfs/bulk-download-prepare`) отключена Яндексом
+ * (HTTP 429, code 394), поэтому файлы перечисляются через `mpfs/list`, а качаются
+ * поштучно по подписанной ссылке из `mpfs/url`.
  */
 export class PhotosliceClient {
   private readonly fetchImpl: FetchLike;
@@ -95,8 +157,18 @@ export class PhotosliceClient {
     });
     const html = await response.text();
 
-    if (!response.ok || /passport\.yandex/i.test(response.url)) {
+    if (
+      response.status === 401 ||
+      response.status === 403 ||
+      /passport\.yandex/i.test(response.url)
+    ) {
       throw new ConfigError('Cookies невалидны — сессия истекла. Обновите: yd photos auth');
+    }
+    if (!response.ok) {
+      throw new HttpError(
+        response.status,
+        `photoslice: не удалось открыть страницу Диска (HTTP ${response.status})`,
+      );
     }
 
     const sk = html.match(/"sk"\s*:\s*"([^"]+)"/);
@@ -110,7 +182,7 @@ export class PhotosliceClient {
     this.uid = uid[1];
   }
 
-  private async call(method: string, params?: unknown): Promise<Record<string, unknown>> {
+  private async call(method: string, params?: unknown): Promise<unknown> {
     await this.ensureSession();
 
     const body: Record<string, unknown> = {
@@ -154,11 +226,19 @@ export class PhotosliceClient {
       }
 
       if (response.ok) {
+        const apiError = extractApiError(data);
+        if (apiError) {
+          throw new HttpError(
+            apiError.status ?? response.status,
+            `photoslice ${method}: ${apiError.title ?? 'ошибка API'}`,
+            data,
+          );
+        }
         if (!data || typeof data !== 'object') {
           throw new HttpError(response.status, `photoslice ${method}: неожиданный ответ`, data);
         }
         this.refreshedForSession = false;
-        return data as Record<string, unknown>;
+        return data;
       }
 
       if (response.status === 401 || response.status === 403) {
@@ -172,6 +252,20 @@ export class PhotosliceClient {
           `Сессия истекла (HTTP ${response.status}). Обновите cookies: yd photos auth`,
         );
       }
+
+      const apiError = extractApiError(data);
+      // Массовая выгрузка ZIP отключена Яндексом (code 394) — повторять бессмысленно.
+      if (
+        response.status === 429 &&
+        (apiError?.code === 394 || /temporarily disabled/i.test(apiError?.title ?? ''))
+      ) {
+        throw new HttpError(
+          response.status,
+          `photoslice ${method}: ${apiError?.title ?? 'функция отключена на стороне Яндекса'}`,
+          data,
+        );
+      }
+
       if (response.status === 429 || response.status >= 500) {
         lastError = new HttpError(
           response.status,
@@ -179,7 +273,8 @@ export class PhotosliceClient {
           data,
         );
         if (attempt >= maxAttempts) break;
-        await sleep(backoffDelay(attempt, baseDelay, maxDelay));
+        const retryAfter = parseRetryAfter(response.headers.get('retry-after'));
+        await sleep(retryAfter ?? backoffDelay(attempt, baseDelay, maxDelay));
         continue;
       }
       throw new HttpError(response.status, `photoslice ${method}: HTTP ${response.status}`, data);
@@ -192,99 +287,67 @@ export class PhotosliceClient {
     );
   }
 
-  async initSnapshot(): Promise<string> {
-    const data = await this.call('intapi/photo-init-snapshot');
-    const psid = data.photoslice_id;
-    if (typeof psid !== 'string' || psid.length === 0) {
-      throw new HttpError(200, 'photoslice: не получен photoslice_id', data);
-    }
-    return psid;
-  }
-
-  /** Готовит ZIP-архив для пачки фото и возвращает ссылку на скачивание. */
-  async bulkDownloadPrepare(refs: string[]): Promise<string> {
-    const data = await this.call('mpfs/bulk-download-prepare', { items: refs });
-    const raw = data.download_url;
-    if (typeof raw !== 'string' || raw.length === 0) {
-      throw new HttpError(200, 'photoslice: не получен download_url', data);
-    }
-    return raw.startsWith('//') ? `https:${raw}` : raw;
-  }
-
-  async getSnapshot(psid: string, amount = 100_000, offset = 0): Promise<PhotoCluster[]> {
-    const data = await this.call('intapi/photo-get-snapshot', {
-      id: psid,
-      locale: 'ru',
+  /**
+   * Одна страница листинга папки безлимита (`mpfs/list`).
+   *
+   * API возвращает саму папку первым элементом (её пропускаем) и до `amount`
+   * детей. `offset` считается по детям, без учёта самой папки.
+   */
+  async listDir(path: string = UNLIM_ROOT, offset = 0, amount = LIST_PAGE): Promise<ListPage> {
+    const data = await this.call('mpfs/list', {
+      path,
       amount,
       offset,
+      meta: LIST_META,
     });
-    const items = Array.isArray(data.items) ? data.items : [];
-    const clusters: PhotoCluster[] = [];
-    for (const raw of items) {
-      const item = raw as Record<string, unknown>;
-      const id = item.id;
-      if (id === undefined || id === null) continue;
-      clusters.push({ id: String(id), size: Number(item.size ?? 0) || 0 });
-    }
-    return clusters;
-  }
-
-  async getClustersWithResources(
-    psid: string,
-    clusters: PhotoCluster[],
-    hideScreenshots = false,
-  ): Promise<PhotoItem[]> {
-    const clustersMap: Record<string, { range: [number, number] }> = {};
-    for (const cluster of clusters) {
-      clustersMap[cluster.id] = { range: [0, Math.max(cluster.size - 1, 0)] };
+    if (!Array.isArray(data)) {
+      throw new HttpError(200, 'photoslice mpfs/list: ожидался список', data);
     }
 
-    const data = await this.call('intapi/photo-get-clusters-with-resources', {
-      photosliceId: psid,
-      clusters: clustersMap,
-      hideScreenshots,
-    });
+    const normalizedDir = path.replace(/\/+$/, '') || '/';
+    const files: PhotoItem[] = [];
+    const dirs: string[] = [];
+    for (const raw of data) {
+      if (!isPlainObject(raw)) continue;
+      const itemPath = str(raw.path);
+      if (!itemPath) continue;
+      const normalized = itemPath.replace(/\/+$/, '') || '/';
+      // Первый элемент ответа — сама запрошенная папка.
+      if (normalized === normalizedDir || normalized === '/') continue;
+      // Корзину не качаем: это удалённые фото.
+      if (normalized.startsWith('/trash')) continue;
 
-    const clustersObj = data.clusters as Record<string, unknown> | undefined;
-    const fetched = Array.isArray(clustersObj?.fetched) ? (clustersObj?.fetched as unknown[]) : [];
-
-    const result: PhotoItem[] = [];
-    for (const rawCluster of fetched) {
-      const cluster = rawCluster as Record<string, unknown>;
-      const clusterId = String(cluster.id ?? '');
-      const items = Array.isArray(cluster.items) ? cluster.items : [];
-      for (const rawItem of items) {
-        const item = rawItem as Record<string, unknown>;
-        const id = item.id ?? item.resource_id;
-        if (id === undefined || id === null) continue;
-        const idStr = String(id);
-        result.push({
-          id: idStr,
-          clusterId,
-          name: str(item.name),
-          size: num(item.size),
-          md5: str(item.md5) ?? str(item.etag),
-          mime: str(item.mimetype) ?? str(item.type),
-          takenAt: str(item.taken_at) ?? str(item.created),
-          remoteRef: idStr,
-        });
+      if (raw.type === 'dir') {
+        dirs.push(normalized);
+        continue;
       }
+      if (raw.type !== 'file') continue;
+
+      const meta = isPlainObject(raw.meta) ? raw.meta : {};
+      files.push({
+        id: normalized,
+        name: str(raw.name) ?? basename(normalized),
+        size: num(meta.size) ?? num(raw.size),
+        md5: str(meta.md5) ?? str(meta.etag),
+        mime: str(meta.mimetype) ?? str(meta.mediatype) ?? str(meta.type) ?? str(raw.mimetype),
+        remoteRef: normalized,
+      });
     }
-    return result;
+    return { files, dirs, children: files.length + dirs.length };
   }
-}
 
-function str(value: unknown): string | null {
-  return typeof value === 'string' && value.length > 0 ? value : null;
-}
-
-function num(value: unknown): number | null {
-  if (typeof value === 'number' && Number.isFinite(value)) return value;
-  if (typeof value === 'string' && value.trim() !== '') {
-    const parsed = Number(value);
-    if (Number.isFinite(parsed)) return parsed;
+  /** Подписанная ссылка на оригинал файла (`mpfs/url`). */
+  async getFileUrl(ref: string): Promise<FileUrl> {
+    const data = await this.call('mpfs/url', { path: ref });
+    if (!isPlainObject(data)) {
+      throw new HttpError(200, 'photoslice mpfs/url: неожиданный ответ', data);
+    }
+    const raw = data.file;
+    if (typeof raw !== 'string' || raw.length === 0) {
+      throw new HttpError(200, 'photoslice: не получена ссылка на файл', data);
+    }
+    return { url: raw.startsWith('//') ? `https:${raw}` : raw };
   }
-  return null;
 }
 
 /** Проверяет, что в cookies есть признак активной сессии. */
