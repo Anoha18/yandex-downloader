@@ -495,6 +495,15 @@ export class StateDb {
       .all() as unknown as Array<{ path: string; md5: string | null; local_path: string | null }>;
   }
 
+  /** Все файлы с локальными путями и статусами — для очистки `.part`. */
+  filesForCleanup(): Array<{ path: string; local_path: string | null; status: FileStatus }> {
+    return this.db.prepare('SELECT path, local_path, status FROM files').all() as unknown as Array<{
+      path: string;
+      local_path: string | null;
+      status: FileStatus;
+    }>;
+  }
+
   // ── очередь скачивания: фото ───────────────────────────────────────────────
 
   claimPendingPhotos(limit: number): PhotoJob[] {

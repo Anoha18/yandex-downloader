@@ -187,7 +187,7 @@ export class HttpClient {
     }
     if (prefix > 0) headers.Range = `bytes=${prefix}-`;
 
-    const connectTimeoutMs = options.connectTimeoutMs ?? 5_000;
+    const connectTimeoutMs = options.connectTimeoutMs ?? 30_000;
     let headerTimedOut = false;
     const headerTimer = setTimeout(() => {
       headerTimedOut = true;

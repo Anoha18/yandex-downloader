@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { runAuth } from './commands/auth.js';
+import { runCleanup } from './commands/cleanup.js';
 import { runConfig } from './commands/config.js';
 import { runDownload } from './commands/download.js';
 import { runLs } from './commands/ls.js';
@@ -31,6 +32,7 @@ const COMMANDS: Record<string, CommandEntry> = {
   photos: { run: runPhotos, summary: 'безлимитные фото: collect | auth | status | export' },
   stats: { run: runStats, summary: 'показать сводку по очереди из БД' },
   download: { run: runDownload, summary: 'скачать файлы из очереди' },
+  cleanup: { run: runCleanup, summary: 'убрать частичные загрузки .part' },
   config: { run: runConfig, summary: 'конфигурация: init | show | path' },
 };
 
@@ -80,6 +82,12 @@ function usage(): string {
     '      --download-timeout <с> таймаут соединения при скачивании, сек (по умолчанию 30)',
     '      --stall-timeout <с>    таймаут простоя без данных для фото, сек (по умолчанию 60)',
     '',
+    'Флаги команды cleanup:',
+    '      --parts               удалить только осиротевшие/устаревшие .part (по умолчанию)',
+    '      --all-parts           удалить все .part',
+    '      --path <dir>          ограничить поддеревом',
+    '      --dry-run             только показать, ничего не удалять',
+    '',
   ].join('\n');
 }
 
@@ -120,6 +128,8 @@ async function main(argv: string[]): Promise<number> {
       quiet: { type: 'boolean' },
       'download-timeout': { type: 'string' },
       'stall-timeout': { type: 'string' },
+      parts: { type: 'boolean' },
+      'all-parts': { type: 'boolean' },
     },
     allowPositionals: true,
     strict: false,
